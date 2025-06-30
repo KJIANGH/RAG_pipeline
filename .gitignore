@@ -1,0 +1,32 @@
+chunks/
+output/
+txts/
+uploads/
+
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# Virtual Environment
+venv/
+.env/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+
+# 本地测试文件
+test/
+tmp/

@@ -8,8 +8,8 @@ import requests
 import json
 import numpy as np
 from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
-from langchain_community.document_loaders import Docx2txtLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import mammoth
+from langchain_text_splitters import MarkdownHeaderTextSplitter, SpacyTextSplitter, CharacterTextSplitter
 
 
 app = Flask(__name__)
@@ -61,33 +61,52 @@ def upload_file(file):
     file.save(save_path)
     return save_path
 
-def chunk_file(docx_path, parent_size=1000, child_size=300, overlap=50):
-    loader = Docx2txtLoader(docx_path)
-    parent_docs = loader.load()
+def convert_docx_to_markdown(docx_path):
+    with open(docx_path, "rb") as f:
+        result = mammoth.convert_to_markdown(f)
+        return result.value  # markdown string
 
-    # parent splitter
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=parent_size, chunk_overlap=overlap)
-    parent_chunks = parent_splitter.split_documents(parent_docs)  # List[Document]
+def chunk_file(docx_path, parent_max_len=500, parent_overlap=50, child_chunk_size=100, child_overlap=15):
+    markdown_text = convert_docx_to_markdown(docx_path)
 
-    # child splitter
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=child_size, chunk_overlap=overlap)
+    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[
+        ("#", "h1"), ("##", "h2"), ("###", "h3")
+    ])
+    raw_parent_docs = header_splitter.split_text(markdown_text)
+
+
+    parent_docs = []
+    char_splitter = CharacterTextSplitter(chunk_size=parent_max_len, chunk_overlap=parent_overlap)
+
+    for doc in raw_parent_docs:
+        if len(doc.page_content) <= parent_max_len:
+            parent_docs.append(doc)
+        else:
+            sub_texts = char_splitter.split_text(doc.page_content)
+            for sub in sub_texts:
+                parent_docs.append(type(doc)(page_content=sub, metadata=doc.metadata.copy()))
+
     
-    all_child_chunks = []
-    for parent_doc in parent_chunks:
+    child_splitter = SpacyTextSplitter(chunk_size=child_chunk_size, chunk_overlap=child_overlap)
+    all_chunks = []
+
+    for parent_doc in parent_docs:
         children = child_splitter.split_text(parent_doc.page_content)
         for child in children:
-            all_child_chunks.append({
+            all_chunks.append({
+                "parent": parent_doc.page_content,
                 "child": child,
-                "parent": parent_doc.page_content
+                "metadata": parent_doc.metadata
             })
 
-    # 保存 parent-child JSON（可扩展加 metadata）
+
     base_name = os.path.splitext(os.path.basename(docx_path))[0]
     chunk_path = os.path.join(CHUNK_FOLDER, base_name + "_parent_child.json")
     with open(chunk_path, "w", encoding="utf-8") as f:
-        json.dump({"parent_child": all_child_chunks}, f, ensure_ascii=False, indent=2)
+        json.dump({"parent_child": all_chunks}, f, ensure_ascii=False, indent=2)
 
     return chunk_path
+    
 
 
 def get_ollama_embedding(text, model_name="qwen3-embed"):
@@ -139,6 +158,7 @@ def embed_chunks_internal(chunk_path, collection_name):
     collection.flush()
     return len(embeddings)
 
+
 @app.route("/upload_and_embed", methods=["POST"])
 @swag_from({
     'tags': ['Step 1: Upload & Embed'],
@@ -166,6 +186,7 @@ def upload_and_embed():
         "chunks_embedded": count,
         "collection": collection_name
     })
+
 
 def get_qwen_embedding(text):
     url = "http://localhost:11434/api/embeddings" 
@@ -279,7 +300,8 @@ def search():
     ]
 
     try:
-        reranked_texts = rerank_documents(query, [doc["child"] for doc in documents])
+        reranked_texts = rerank_documents(query, [doc["child"] + "\n\n" + doc["parent"] for doc in documents])
+
         reranked_full = []
         for text in reranked_texts:
             for doc in documents:

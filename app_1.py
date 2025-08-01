@@ -296,6 +296,30 @@ def get_qwen_embedding(text):
         return response.json()['embedding']
     else:
         raise ValueError("Embedding failed: " + response.text)
+
+
+def extract_section_from_query(query):
+    match = re.findall(r'\b\d+(\.\d+)+\b', query)
+    return match if match else None
+
+def extract_term_from_query(query):
+    words = re.findall(r'\b[A-Za-z0-9一-龥]{2,}\b', query)
+    stopwords = {"是什么", "如何", "哪里", "第几条", "合同", "规定"}
+    terms = [w for w in words if w not in stopwords]
+    
+    return terms if terms else None
+
+
+def classify_query_complexity(query):
+    query_len = len(query.split())
+    lower_q = query.lower()
+
+    complex_keywords = ["why", "compare", "difference", "分析", "比较", "原因", "步骤", "推理", "多步"]
+
+    if query_len > 12 or any(k in lower_q for k in complex_keywords):
+        return "complex"
+    else:
+        return "normal"
     
 
 classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
@@ -432,28 +456,55 @@ def search():
     if not query:
         return jsonify({"error": "Query is missing"}), 400
 
+    query_complexity = classify_query_complexity(query)
     query_type = classify_query_type(query)
-    
+
+    top_k_final = top_k if query_complexity == "normal" else top_k * 2
+
     if query_type == "precise_lookup":
-        results = bm25_search(query, top_k)
-    
+        results = bm25_search(query, top_k_final)
+
     elif query_type == "explain_compare":
-        results = hybrid_search(query, top_k-1, top_k-1)
-    
+        results = hybrid_search(query, top_k_final, top_k_final)
+
     else:
         connections.connect(host="localhost", port="19530")
         collection = Collection(collection_name)
         collection.load()
         query_embedding = get_qwen_embedding(query)
-        results = embedding_search(collection, query_embedding, top_k)
+        results = embedding_search(collection, query_embedding, top_k_final)
 
+    query_section = extract_section_from_query(query)
+    query_terms = extract_term_from_query(query)
 
+    if query_section or query_terms:
+        filtered_results = []
+        for doc in results:
+            section_match = not query_section or doc["metadata"].get("section") in query_section
+            term_match = not query_terms or any(t in doc["metadata"].get("term", "") for t in query_terms)
+            
+            if section_match and term_match:
+                filtered_results.append(doc)
+        
+        if filtered_results:
+            results = filtered_results
+
+    priority_docs = []
+    normal_docs = []
+    for doc in results:
+        if (doc["metadata"].get("section") and doc["metadata"]["section"] in query) or \
+        (doc["metadata"].get("term") and doc["metadata"]["term"] in query):
+            priority_docs.append(doc)
+        else:
+            normal_docs.append(doc)
+
+    docs_for_rerank = priority_docs + normal_docs
 
     try:
-        texts_to_rerank = [doc["child"] + "\n\n" + doc["parent"] for doc in results]
+        texts_to_rerank = [doc["child"] + "\n\n" + doc["parent"] for doc in docs_for_rerank]
         reranked_texts = rerank_documents(query, texts_to_rerank)
 
-        text_to_doc = {doc["child"] + "\n\n" + doc["parent"]: doc for doc in results}
+        text_to_doc = {doc["child"] + "\n\n" + doc["parent"]: doc for doc in docs_for_rerank}
         reranked_full = [text_to_doc[text] for text in reranked_texts if text in text_to_doc]
 
         prompt = query + "\n\n" + "\n\n---\n\n".join(reranked_texts) + "\n\n" + "请根据这个用户的query加上利用RAG系统检索出来的相关词条完善回答"
